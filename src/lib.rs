@@ -154,8 +154,8 @@ fn on_add_textinputnode(mut world: DeferredWorld, context: HookContext) {
 
 fn on_remove_unfocus(mut world: DeferredWorld, context: HookContext) {
     let mut input_focus = world.resource_mut::<InputFocus>();
-    if input_focus.0 == Some(context.entity) {
-        input_focus.0 = None;
+    if input_focus.get() == Some(context.entity) {
+        input_focus.clear();
     }
 }
 

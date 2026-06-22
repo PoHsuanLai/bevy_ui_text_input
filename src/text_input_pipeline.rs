@@ -14,37 +14,57 @@ use bevy::ecs::system::Query;
 use bevy::ecs::system::Res;
 use bevy::ecs::system::ResMut;
 use bevy::ecs::world::Ref;
+use bevy::asset::RenderAssetUsages;
 use bevy::image::Image;
-use bevy::image::TextureAtlasLayout;
 use bevy::math::Rect;
 use bevy::math::UVec2;
 use bevy::math::Vec2;
 use bevy::platform::collections::HashMap;
+use bevy::render::render_resource::Extent3d;
+use bevy::render::render_resource::TextureDimension;
+use bevy::render::render_resource::TextureFormat;
 use bevy::text::Font;
 use bevy::text::FontAtlas;
-use bevy::text::FontAtlasKey;
-use bevy::text::FontAtlasSet;
 use bevy::text::FontSmoothing;
+use bevy::text::GlyphAtlasInfo;
+use bevy::text::GlyphCacheKey;
 use bevy::text::LineBreak;
 use bevy::text::LineHeight;
 use bevy::text::TextBounds;
 use bevy::text::TextError;
 use bevy::text::TextFont;
-use bevy::text::add_glyph_to_atlas;
-use bevy::text::get_glyph_atlas_info;
+use bevy::text::{FontSize, FontSource};
 use bevy::ui::ComputedNode;
 use cosmic_text;
 use cosmic_text::Buffer;
+use cosmic_text::CacheKey;
 use cosmic_text::Edit;
 use cosmic_text::Metrics;
+use cosmic_text::SwashContent;
 use std::sync::Arc;
+
+/// Key identifying the set of [`FontAtlas`]es for a particular rasterized font + size + smoothing.
+///
+/// In Bevy 0.18 this crate reused bevy's `FontAtlasKey`/`FontAtlasSet`. Bevy 0.19's
+/// `FontAtlasKey` is tied to bevy's own parley-based font ids, which this crate (which keeps
+/// its own cosmic-text pipeline) does not have. So we key our atlases by the cosmic-text
+/// font id + the physical font-size bits + the font smoothing mode instead.
+#[derive(Debug, Hash, PartialEq, Eq, Clone, Copy)]
+pub(crate) struct CosmicFontAtlasKey {
+    font_id: cosmic_text::fontdb::ID,
+    font_size_bits: u32,
+    font_smoothing: FontSmoothing,
+}
 
 #[derive(Resource)]
 pub struct TextInputPipeline {
     pub(crate) handle_to_font_id_map: HashMap<AssetId<Font>, (cosmic_text::fontdb::ID, Arc<str>)>,
     pub font_system: cosmic_text::FontSystem,
     pub(crate) swash_cache: cosmic_text::SwashCache,
-    pub(crate) font_atlas_sets: HashMap<AssetId<Font>, FontAtlasSet>,
+    /// Rasterized glyph atlases, keyed first by bevy font asset (so they can be dropped when the
+    /// font asset is removed) and then by the physical font size / smoothing.
+    pub(crate) font_atlas_sets:
+        HashMap<AssetId<Font>, HashMap<CosmicFontAtlasKey, Vec<FontAtlas>>>,
 }
 
 impl Default for TextInputPipeline {
@@ -69,19 +89,21 @@ struct FontFaceInfo {
 }
 
 fn load_font_to_fontdb(
-    text_font: &TextFont,
+    font_id: AssetId<Font>,
     font_system: &mut cosmic_text::FontSystem,
     map_handle_to_font_id: &mut HashMap<AssetId<Font>, (cosmic_text::fontdb::ID, Arc<str>)>,
     fonts: &Assets<Font>,
 ) -> FontFaceInfo {
-    let font_handle = text_font.font.clone();
     let (face_id, family_name) = map_handle_to_font_id
-        .entry(font_handle.id())
+        .entry(font_id)
         .or_insert_with(|| {
-            let font = fonts.get(font_handle.id()).expect(
+            let font = fonts.get(font_id).expect(
                 "Tried getting a font that was not available, probably due to not being loaded yet",
             );
-            let data = Arc::clone(&font.data);
+            // In Bevy 0.19 `Font::data` is a `parley::fontique::Blob<u8>` rather than the
+            // `Arc<Vec<u8>>` it was in 0.18. Copy the bytes into a fresh `Arc<Vec<u8>>` so
+            // cosmic-text's `fontdb` can own them.
+            let data: Arc<Vec<u8>> = Arc::new(font.data.data().to_vec());
             let ids = font_system
                 .db_mut()
                 .load_font_source(cosmic_text::fontdb::Source::Binary(data));
@@ -103,6 +125,150 @@ fn load_font_to_fontdb(
     }
 }
 
+/// Convert a bevy [`Justify`] into a cosmic-text [`Align`].
+///
+/// In Bevy 0.18 `cosmic_text::Align` implemented `From<Justify>`. In 0.19 that auto-conversion is
+/// gone (and `Justify` gained `Start`/`End` variants), so we convert explicitly.
+fn justify_to_align(justify: bevy::text::Justify) -> cosmic_text::Align {
+    use bevy::text::Justify;
+    match justify {
+        Justify::Left => cosmic_text::Align::Left,
+        Justify::Right => cosmic_text::Align::Right,
+        Justify::Center => cosmic_text::Align::Center,
+        Justify::Justified => cosmic_text::Align::Justified,
+        Justify::Start => cosmic_text::Align::Left,
+        Justify::End => cosmic_text::Align::Right,
+    }
+}
+
+/// Extract the f32 font size from a [`TextFont`], falling back to 12.0 for non-pixel sizes.
+fn text_font_size(text_font: &TextFont) -> f32 {
+    match text_font.font_size {
+        FontSize::Px(v) => v,
+        _ => 12.0,
+    }
+}
+
+/// Extract the bevy [`Font`] asset id from a [`TextFont`], if it uses a handle-based font source.
+///
+/// This crate only supports handle-based fonts (it loads the font bytes into its own cosmic-text
+/// `fontdb`). Other `FontSource` variants (family / generic families) are unsupported.
+fn text_font_handle_id(text_font: &TextFont) -> Option<AssetId<Font>> {
+    match &text_font.font {
+        FontSource::Handle(handle) => Some(handle.id()),
+        _ => None,
+    }
+}
+
+/// Rasterize a cosmic-text glyph via cosmic-text's own swash cache and add it to a bevy
+/// [`FontAtlas`], returning the [`GlyphAtlasInfo`] describing where it landed.
+///
+/// In Bevy 0.18 this crate used bevy's `add_glyph_to_atlas`, which rasterized cosmic-text glyphs
+/// through bevy's `TextureAtlasLayout`-based path. Bevy 0.19's `add_glyph_to_atlas` requires a
+/// swash `Scaler` built from bevy's own font ids, which don't exist here. Instead we rasterize the
+/// glyph directly with cosmic-text's `SwashCache` and feed the resulting image into a bevy
+/// [`FontAtlas`] via [`FontAtlas::add_glyph`], preserving the previous rendering behavior.
+fn add_cosmic_glyph_to_atlas(
+    font_atlases: &mut Vec<FontAtlas>,
+    textures: &mut Assets<Image>,
+    font_system: &mut cosmic_text::FontSystem,
+    swash_cache: &mut cosmic_text::SwashCache,
+    cache_key: CacheKey,
+    font_smoothing: FontSmoothing,
+) -> Result<GlyphAtlasInfo, TextError> {
+    let glyph_key = GlyphCacheKey {
+        glyph_id: cache_key.glyph_id,
+    };
+
+    // Already rasterized? Return the cached info.
+    if let Some(info) = get_atlas_info(font_atlases, glyph_key) {
+        return Ok(info);
+    }
+
+    let image = swash_cache
+        .get_image_uncached(font_system, cache_key)
+        .ok_or(TextError::FailedToGetGlyphImage(cache_key.glyph_id))?;
+
+    let width = image.placement.width;
+    let height = image.placement.height;
+
+    // Convert the swash image into an RGBA bevy `Image`.
+    let (rgba, is_alpha_mask) = match image.content {
+        SwashContent::Mask => {
+            let px = (width * height) as usize;
+            let mut rgba = vec![0u8; px * 4];
+            match font_smoothing {
+                FontSmoothing::AntiAliased => {
+                    for i in 0..px {
+                        let a = image.data[i];
+                        rgba[i * 4] = 255;
+                        rgba[i * 4 + 1] = 255;
+                        rgba[i * 4 + 2] = 255;
+                        rgba[i * 4 + 3] = a;
+                    }
+                }
+                FontSmoothing::None => {
+                    for i in 0..px {
+                        let a = image.data[i];
+                        rgba[i * 4] = 255;
+                        rgba[i * 4 + 1] = 255;
+                        rgba[i * 4 + 2] = 255;
+                        rgba[i * 4 + 3] = if 127 < a { 255 } else { 0 };
+                    }
+                }
+            }
+            (rgba, true)
+        }
+        SwashContent::Color | SwashContent::SubpixelMask => (image.data, false),
+    };
+
+    // Guard against zero-sized glyphs (e.g. spaces) which can't be packed into an atlas.
+    if width == 0 || height == 0 {
+        return Err(TextError::FailedToGetGlyphImage(cache_key.glyph_id));
+    }
+
+    let glyph_image = Image::new(
+        Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        TextureDimension::D2,
+        rgba,
+        TextureFormat::Rgba8UnormSrgb,
+        RenderAssetUsages::MAIN_WORLD,
+    );
+
+    let offset = Vec2::new(image.placement.left as f32, -image.placement.top as f32);
+
+    let mut try_add = |atlas: &mut FontAtlas| -> Result<(), TextError> {
+        atlas.add_glyph(textures, glyph_key, &glyph_image, offset, is_alpha_mask)
+    };
+
+    if !font_atlases.iter_mut().any(|atlas| try_add(atlas).is_ok()) {
+        // Create a new atlas large enough for this glyph.
+        let glyph_max_size = width.max(height);
+        let containing = (1u32 << (32 - glyph_max_size.leading_zeros())).max(512);
+        let mut new_atlas = FontAtlas::new(textures, UVec2::splat(containing), font_smoothing);
+        new_atlas.add_glyph(textures, glyph_key, &glyph_image, offset, is_alpha_mask)?;
+        font_atlases.push(new_atlas);
+    }
+
+    get_atlas_info(font_atlases, glyph_key).ok_or(TextError::InconsistentAtlasState)
+}
+
+/// Look up the [`GlyphAtlasInfo`] for an already-rasterized glyph across a font's atlases.
+fn get_atlas_info(font_atlases: &[FontAtlas], glyph_key: GlyphCacheKey) -> Option<GlyphAtlasInfo> {
+    font_atlases.iter().find_map(|atlas| {
+        atlas.get_glyph_index(glyph_key).map(|location| GlyphAtlasInfo {
+            offset: location.offset,
+            rect: atlas.texture_atlas.textures[location.glyph_index].as_rect(),
+            texture: atlas.texture.id(),
+            is_alpha_mask: location.is_alpha_mask,
+        })
+    })
+}
+
 fn buffer_dimensions(buffer: &cosmic_text::Buffer) -> Vec2 {
     let (width, height) = buffer
         .layout_runs()
@@ -116,7 +282,6 @@ fn buffer_dimensions(buffer: &cosmic_text::Buffer) -> Vec2 {
 pub fn text_input_system(
     mut textures: ResMut<Assets<Image>>,
     fonts: Res<Assets<Font>>,
-    mut texture_atlases: ResMut<Assets<TextureAtlasLayout>>,
     mut text_input_pipeline: ResMut<TextInputPipeline>,
     mut text_query: Query<(
         Ref<ComputedNode>,
@@ -131,6 +296,13 @@ pub fn text_input_system(
         text_query.iter_mut()
     {
         let layout_info = text_input_layout_info.into_inner();
+
+        // This crate only supports handle-based fonts. Skip other `FontSource` variants.
+        let Some(font_id) = text_font_handle_id(&text_font) else {
+            continue;
+        };
+        let text_font_size = text_font_size(&text_font);
+
         if editor.needs_update
             || text_font.is_changed()
             || line_height.is_changed()
@@ -144,7 +316,7 @@ pub fn text_input_system(
 
             let line_height = match *line_height {
                 LineHeight::Px(h) => h,
-                LineHeight::RelativeToFont(r) => r * text_font.font_size,
+                LineHeight::RelativeToFont(r) => r * text_font_size,
             };
 
             let result = editor.editor.with_buffer_mut(|buffer| {
@@ -153,14 +325,14 @@ pub fn text_input_system(
                     handle_to_font_id_map: map_handle_to_font_id,
                     ..
                 } = &mut *text_input_pipeline;
-                if !fonts.contains(text_font.font.id()) {
+                if !fonts.contains(font_id) {
                     return Err(TextError::NoSuchFont);
                 }
 
                 let face_info =
-                    load_font_to_fontdb(&text_font, font_system, map_handle_to_font_id, &fonts);
+                    load_font_to_fontdb(font_id, font_system, map_handle_to_font_id, &fonts);
 
-                let mut metrics = Metrics::new(text_font.font_size, line_height)
+                let mut metrics = Metrics::new(text_font_size, line_height)
                     .scale(node.inverse_scale_factor().recip());
 
                 metrics.font_size = metrics.font_size.max(0.000001);
@@ -179,7 +351,7 @@ pub fn text_input_system(
                     .metrics(metrics);
 
                 let text = crate::get_text(buffer);
-                let align = Some(input.justification.into());
+                let align = Some(justify_to_align(input.justification));
                 buffer.set_text(
                     font_system,
                     &text,
@@ -234,7 +406,6 @@ pub fn text_input_system(
                         .try_for_each(|(layout_glyph, line_y, line_i)| {
                             let mut temp_glyph;
                             let span_index = layout_glyph.metadata;
-                            let font_id = text_font.font.id();
                             let font_smoothing = text_font.font_smoothing;
 
                             let layout_glyph = if font_smoothing == FontSmoothing::None {
@@ -266,42 +437,27 @@ pub fn text_input_system(
                             let physical_glyph = layout_glyph.physical((0., 0.), 1.);
 
                             let font_atlases = font_atlas_set
-                                .entry(FontAtlasKey(
-                                    font_id,
-                                    physical_glyph.cache_key.font_size_bits,
+                                .entry(CosmicFontAtlasKey {
+                                    font_id: physical_glyph.cache_key.font_id,
+                                    font_size_bits: physical_glyph.cache_key.font_size_bits,
                                     font_smoothing,
-                                ))
-                                .or_insert_with(|| {
-                                    vec![FontAtlas::new(
-                                        &mut textures,
-                                        &mut texture_atlases,
-                                        UVec2::splat(512),
-                                        font_smoothing,
-                                    )]
-                                });
+                                })
+                                .or_default();
 
-                            let atlas_info =
-                                get_glyph_atlas_info(font_atlases, physical_glyph.cache_key)
-                                    .map(Ok)
-                                    .unwrap_or_else(|| {
-                                        add_glyph_to_atlas(
-                                            font_atlases,
-                                            &mut texture_atlases,
-                                            &mut textures,
-                                            font_system,
-                                            swash_cache,
-                                            layout_glyph,
-                                            font_smoothing,
-                                        )
-                                    })?;
+                            let atlas_info = add_cosmic_glyph_to_atlas(
+                                font_atlases,
+                                &mut textures,
+                                font_system,
+                                swash_cache,
+                                physical_glyph.cache_key,
+                                font_smoothing,
+                            )?;
 
-                            let texture_atlas =
-                                texture_atlases.get(atlas_info.texture_atlas).unwrap();
-                            let location = atlas_info.location;
-                            let glyph_rect = texture_atlas.textures[location.glyph_index];
-                            let left = location.offset.x as f32;
-                            let top = location.offset.y as f32;
-                            let glyph_size = UVec2::new(glyph_rect.width(), glyph_rect.height());
+                            let glyph_size =
+                                UVec2::new(atlas_info.rect.width() as u32, atlas_info.rect.height() as u32);
+                            // `atlas_info.offset` is `Vec2(placement.left, -placement.top)`.
+                            let left = atlas_info.offset.x;
+                            let top = -atlas_info.offset.y;
 
                             // offset by half the size because the origin is center
                             let x = glyph_size.x as f32 / 2.0 + left + physical_glyph.x as f32;
@@ -340,6 +496,8 @@ pub fn text_input_system(
                     | TextError::FailedToGetGlyphImage(_)
                     | TextError::MissingAtlasLayout
                     | TextError::MissingAtlasTexture
+                    | TextError::NoSuchFontFamily(_)
+                    | TextError::DegenerateScaleFactor
                     | TextError::InconsistentAtlasState),
                 ) => {
                     panic!("Fatal error when processing text: {e}.");
@@ -357,7 +515,6 @@ pub fn text_input_system(
 pub fn text_input_prompt_system(
     mut textures: ResMut<Assets<Image>>,
     fonts: Res<Assets<Font>>,
-    mut texture_atlases: ResMut<Assets<TextureAtlasLayout>>,
     mut text_input_pipeline: ResMut<TextInputPipeline>,
     mut text_query: Query<(
         Ref<ComputedNode>,
@@ -392,19 +549,27 @@ pub fn text_input_prompt_system(
                 handle_to_font_id_map: map_handle_to_font_id,
                 ..
             } = &mut *text_input_pipeline;
-            if !fonts.contains(text_font.font.id()) {
+
+            let font = prompt.font.as_ref().unwrap_or(text_font.as_ref());
+
+            // This crate only supports handle-based fonts. Skip other `FontSource` variants.
+            let Some(font_id) = text_font_handle_id(font) else {
+                editor.prompt_buffer = None;
+                continue;
+            };
+            if !fonts.contains(font_id) {
                 editor.prompt_buffer = None;
                 continue;
             }
 
-            let font = prompt.font.as_ref().unwrap_or(text_font.as_ref());
+            let font_pixel_size = text_font_size(font);
 
             let line_height = match *line_height {
                 LineHeight::Px(h) => h,
-                LineHeight::RelativeToFont(r) => r * font.font_size,
+                LineHeight::RelativeToFont(r) => r * font_pixel_size,
             };
 
-            let metrics = Metrics::new(font.font_size, line_height)
+            let metrics = Metrics::new(font_pixel_size, line_height)
                 .scale(node.inverse_scale_factor().recip());
 
             if metrics.font_size <= 0. || metrics.line_height <= 0. {
@@ -422,7 +587,8 @@ pub fn text_input_prompt_system(
                 height: Some(node.size().y),
             };
 
-            let face_info = load_font_to_fontdb(font, font_system, map_handle_to_font_id, &fonts);
+            let face_info =
+                load_font_to_fontdb(font_id, font_system, map_handle_to_font_id, &fonts);
 
             buffer.set_size(font_system, bounds.width, bounds.height);
 
@@ -444,7 +610,7 @@ pub fn text_input_prompt_system(
                 .weight(face_info.weight)
                 .metrics(metrics);
 
-            let align = Some(input.justification.into());
+            let align = Some(justify_to_align(input.justification));
             buffer.set_text(
                 font_system,
                 &prompt.text,
@@ -463,7 +629,6 @@ pub fn text_input_prompt_system(
                     .try_for_each(|(layout_glyph, line_y, line_i)| {
                         let mut temp_glyph;
                         let span_index = layout_glyph.metadata;
-                        let font_id = text_font.font.id();
                         let font_smoothing = text_font.font_smoothing;
 
                         let layout_glyph = if font_smoothing == FontSmoothing::None {
@@ -494,41 +659,27 @@ pub fn text_input_prompt_system(
                         let physical_glyph = layout_glyph.physical((0., 0.), 1.);
 
                         let font_atlases = font_atlas_set
-                            .entry(FontAtlasKey(
-                                font_id,
-                                physical_glyph.cache_key.font_size_bits,
+                            .entry(CosmicFontAtlasKey {
+                                font_id: physical_glyph.cache_key.font_id,
+                                font_size_bits: physical_glyph.cache_key.font_size_bits,
                                 font_smoothing,
-                            ))
-                            .or_insert_with(|| {
-                                vec![FontAtlas::new(
-                                    &mut textures,
-                                    &mut texture_atlases,
-                                    UVec2::splat(512),
-                                    font_smoothing,
-                                )]
-                            });
+                            })
+                            .or_default();
 
-                        let atlas_info =
-                            get_glyph_atlas_info(font_atlases, physical_glyph.cache_key)
-                                .map(Ok)
-                                .unwrap_or_else(|| {
-                                    add_glyph_to_atlas(
-                                        font_atlases,
-                                        &mut texture_atlases,
-                                        &mut textures,
-                                        font_system,
-                                        swash_cache,
-                                        layout_glyph,
-                                        font_smoothing,
-                                    )
-                                })?;
+                        let atlas_info = add_cosmic_glyph_to_atlas(
+                            font_atlases,
+                            &mut textures,
+                            font_system,
+                            swash_cache,
+                            physical_glyph.cache_key,
+                            font_smoothing,
+                        )?;
 
-                        let texture_atlas = texture_atlases.get(atlas_info.texture_atlas).unwrap();
-                        let location = atlas_info.location;
-                        let glyph_rect = texture_atlas.textures[location.glyph_index];
-                        let left = location.offset.x as f32;
-                        let top = location.offset.y as f32;
-                        let glyph_size = UVec2::new(glyph_rect.width(), glyph_rect.height());
+                        let glyph_size =
+                            UVec2::new(atlas_info.rect.width() as u32, atlas_info.rect.height() as u32);
+                        // `atlas_info.offset` is `Vec2(placement.left, -placement.top)`.
+                        let left = atlas_info.offset.x;
+                        let top = -atlas_info.offset.y;
 
                         // offset by half the size because the origin is center
                         let x = glyph_size.x as f32 / 2.0 + left + physical_glyph.x as f32;
@@ -563,6 +714,8 @@ pub fn text_input_prompt_system(
                     | TextError::FailedToGetGlyphImage(_)
                     | TextError::MissingAtlasLayout
                     | TextError::MissingAtlasTexture
+                    | TextError::NoSuchFontFamily(_)
+                    | TextError::DegenerateScaleFactor
                     | TextError::InconsistentAtlasState),
                 ) => {
                     panic!("Fatal error when processing text: {e}.");

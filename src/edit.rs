@@ -25,6 +25,7 @@ use bevy::input::keyboard::Key;
 use bevy::input::keyboard::KeyboardInput;
 use bevy::input::mouse::MouseScrollUnit;
 use bevy::input::mouse::MouseWheel;
+use bevy::input_focus::FocusCause;
 use bevy::input_focus::FocusedInput;
 use bevy::input_focus::InputFocus;
 use bevy::math::Rect;
@@ -117,7 +118,7 @@ pub(crate) fn on_drag_text_input(
     }
 
     if input_focus
-        .0
+        .get()
         .is_none_or(|input_focus_entity| input_focus_entity != trigger.entity)
     {
         return;
@@ -175,7 +176,8 @@ pub(crate) fn on_text_input_pressed(
         .get()
         .is_none_or(|active_input| active_input != trigger.entity)
     {
-        input_focus.set(trigger.entity);
+        // Click-to-focus is a pointer press, so report the focus cause as `Pressed`.
+        input_focus.set(trigger.entity, FocusCause::Pressed);
     }
 
     let rect = Rect::from_center_size(transform.translation, node.size());

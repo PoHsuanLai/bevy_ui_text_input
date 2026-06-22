@@ -7,7 +7,6 @@ use crate::TextInputPromptLayoutInfo;
 use crate::TextInputStyle;
 use crate::edit::is_buffer_empty;
 use bevy::asset::AssetId;
-use bevy::asset::Assets;
 use bevy::camera::visibility::InheritedVisibility;
 use bevy::color::Alpha;
 use bevy::color::LinearRgba;
@@ -16,7 +15,6 @@ use bevy::ecs::system::Commands;
 use bevy::ecs::system::Query;
 use bevy::ecs::system::Res;
 use bevy::ecs::system::ResMut;
-use bevy::image::TextureAtlasLayout;
 use bevy::input_focus::InputFocus;
 use bevy::math::Affine2;
 use bevy::math::Rect;
@@ -27,6 +25,7 @@ use bevy::sprite::BorderRect;
 use bevy::text::TextColor;
 use bevy::ui::CalculatedClip;
 use bevy::ui::ComputedNode;
+use bevy::ui::ComputedStackIndex;
 use bevy::ui::ComputedUiTargetCamera;
 use bevy::ui::ResolvedBorderRadius;
 use bevy::ui::UiGlobalTransform;
@@ -42,12 +41,12 @@ use cosmic_text::Edit;
 pub fn extract_text_input_nodes(
     mut commands: Commands,
     mut extracted_uinodes: ResMut<ExtractedUiNodes>,
-    texture_atlases: Extract<Res<Assets<TextureAtlasLayout>>>,
     active_text_input: Extract<Res<InputFocus>>,
     uinode_query: Extract<
         Query<(
             Entity,
             &ComputedNode,
+            &ComputedStackIndex,
             &UiGlobalTransform,
             &InheritedVisibility,
             Option<&CalculatedClip>,
@@ -69,6 +68,7 @@ pub fn extract_text_input_nodes(
     for (
         entity,
         uinode,
+        stack_index,
         global_transform,
         inherited_visibility,
         clip,
@@ -127,7 +127,7 @@ pub fn extract_text_input_nodes(
                 rect.size()
             } + 2. * Vec2::X;
             extracted_uinodes.uinodes.push(ExtractedUiNode {
-                z_order: uinode.stack_index as f32 + stack_z_offsets::TEXT,
+                z_order: stack_index.0 as f32 + stack_z_offsets::TEXT,
                 image: AssetId::default(),
                 clip,
                 extracted_camera_entity,
@@ -150,7 +150,7 @@ pub fn extract_text_input_nodes(
             });
         }
 
-        let cursor_visable = active_text_input.0.is_some_and(|active| active == entity)
+        let cursor_visable = active_text_input.get().is_some_and(|active| active == entity)
             && input.is_enabled
             && input_buffer.cursor_blink_time < style.blink_interval
             && !style.cursor_color.is_fully_transparent();
@@ -183,12 +183,8 @@ pub fn extract_text_input_nodes(
                 color
             };
 
-            let Some(rect) = texture_atlases
-                .get(atlas_info.texture_atlas)
-                .map(|atlas| atlas.textures[atlas_info.location.glyph_index].as_rect())
-            else {
-                continue;
-            };
+            // In Bevy 0.19 the glyph's atlas rectangle is stored directly on `GlyphAtlasInfo`.
+            let rect = atlas_info.rect;
 
             extracted_uinodes.glyphs.push(ExtractedGlyph {
                 color: color_out,
@@ -197,7 +193,7 @@ pub fn extract_text_input_nodes(
             });
 
             extracted_uinodes.uinodes.push(ExtractedUiNode {
-                z_order: uinode.stack_index as f32 + stack_z_offsets::TEXT,
+                z_order: stack_index.0 as f32 + stack_z_offsets::TEXT,
                 image: atlas_info.texture,
                 clip,
                 extracted_camera_entity,
@@ -221,7 +217,7 @@ pub fn extract_text_input_nodes(
             let width = style.cursor_width * scale_factor;
 
             extracted_uinodes.uinodes.push(ExtractedUiNode {
-                z_order: uinode.stack_index as f32 + stack_z_offsets::TEXT,
+                z_order: stack_index.0 as f32 + stack_z_offsets::TEXT,
                 image: AssetId::default(),
                 clip,
                 extracted_camera_entity,
@@ -250,11 +246,11 @@ pub fn extract_text_input_nodes(
 pub fn extract_text_input_prompts(
     mut commands: Commands,
     mut extracted_uinodes: ResMut<ExtractedUiNodes>,
-    texture_atlases: Extract<Res<Assets<TextureAtlasLayout>>>,
     uinode_query: Extract<
         Query<(
             Entity,
             &ComputedNode,
+            &ComputedStackIndex,
             &UiGlobalTransform,
             &InheritedVisibility,
             Option<&CalculatedClip>,
@@ -275,6 +271,7 @@ pub fn extract_text_input_prompts(
     for (
         entity,
         uinode,
+        stack_index,
         global_transform,
         inherited_visibility,
         clip,
@@ -324,18 +321,15 @@ pub fn extract_text_input_prompts(
             ..
         } in text_layout_info.glyphs.iter()
         {
-            let rect = texture_atlases
-                .get(atlas_info.texture_atlas)
-                .unwrap()
-                .textures[atlas_info.location.glyph_index]
-                .as_rect();
+            // In Bevy 0.19 the glyph's atlas rectangle is stored directly on `GlyphAtlasInfo`.
+            let rect = atlas_info.rect;
             extracted_uinodes.glyphs.push(ExtractedGlyph {
                 color,
                 translation: *position,
                 rect,
             });
             extracted_uinodes.uinodes.push(ExtractedUiNode {
-                z_order: uinode.stack_index() as f32 + stack_z_offsets::TEXT,
+                z_order: stack_index.0 as f32 + stack_z_offsets::TEXT,
                 transform,
                 image: atlas_info.texture,
                 clip,
