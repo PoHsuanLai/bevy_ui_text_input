@@ -175,19 +175,24 @@ fn add_cosmic_glyph_to_atlas(
     swash_cache: &mut cosmic_text::SwashCache,
     cache_key: CacheKey,
     font_smoothing: FontSmoothing,
-) -> Result<GlyphAtlasInfo, TextError> {
+) -> Result<Option<GlyphAtlasInfo>, TextError> {
     let glyph_key = GlyphCacheKey {
         glyph_id: cache_key.glyph_id,
     };
 
     // Already rasterized? Return the cached info.
     if let Some(info) = get_atlas_info(font_atlases, glyph_key) {
-        return Ok(info);
+        return Ok(Some(info));
     }
 
-    let image = swash_cache
-        .get_image_uncached(font_system, cache_key)
-        .ok_or(TextError::FailedToGetGlyphImage(cache_key.glyph_id))?;
+    // A glyph with no rasterised image is *blank*, not broken. Whitespace is
+    // the common case — swash has nothing to draw for U+0020 and correctly
+    // returns `None`. Treating that as an error made a single space anywhere
+    // in a text input's content or prompt fatal, because the caller's `?`
+    // reached a `panic!`.
+    let Some(image) = swash_cache.get_image_uncached(font_system, cache_key) else {
+        return Ok(None);
+    };
 
     let width = image.placement.width;
     let height = image.placement.height;
@@ -222,9 +227,11 @@ fn add_cosmic_glyph_to_atlas(
         SwashContent::Color | SwashContent::SubpixelMask => (image.data, false),
     };
 
-    // Guard against zero-sized glyphs (e.g. spaces) which can't be packed into an atlas.
+    // Zero-sized glyphs (spaces again, and combining marks that render to
+    // nothing) cannot be packed into an atlas, and do not need to be: there
+    // is no ink. Same reasoning as the `None` above — blank, not broken.
     if width == 0 || height == 0 {
-        return Err(TextError::FailedToGetGlyphImage(cache_key.glyph_id));
+        return Ok(None);
     }
 
     let glyph_image = Image::new(
@@ -254,7 +261,9 @@ fn add_cosmic_glyph_to_atlas(
         font_atlases.push(new_atlas);
     }
 
-    get_atlas_info(font_atlases, glyph_key).ok_or(TextError::InconsistentAtlasState)
+    get_atlas_info(font_atlases, glyph_key)
+        .map(Some)
+        .ok_or(TextError::InconsistentAtlasState)
 }
 
 /// Look up the [`GlyphAtlasInfo`] for an already-rasterized glyph across a font's atlases.
@@ -444,14 +453,21 @@ pub fn text_input_system(
                                 })
                                 .or_default();
 
-                            let atlas_info = add_cosmic_glyph_to_atlas(
+                            // `None` means no ink — whitespace, and combining
+                            // marks that render to nothing. The pen already
+                            // advanced, so layout is unaffected; there is just
+                            // nothing to draw and nothing to push.
+                            let Some(atlas_info) = add_cosmic_glyph_to_atlas(
                                 font_atlases,
                                 &mut textures,
                                 font_system,
                                 swash_cache,
                                 physical_glyph.cache_key,
                                 font_smoothing,
-                            )?;
+                            )?
+                            else {
+                                return Ok(());
+                            };
 
                             let glyph_size =
                                 UVec2::new(atlas_info.rect.width() as u32, atlas_info.rect.height() as u32);
@@ -666,14 +682,21 @@ pub fn text_input_prompt_system(
                             })
                             .or_default();
 
-                        let atlas_info = add_cosmic_glyph_to_atlas(
+                        // `None` means the glyph has no ink — whitespace, and
+                        // combining marks that render to nothing. It still
+                        // advanced the pen, so layout is unaffected; there is
+                        // simply nothing to draw and nothing to push.
+                        let Some(atlas_info) = add_cosmic_glyph_to_atlas(
                             font_atlases,
                             &mut textures,
                             font_system,
                             swash_cache,
                             physical_glyph.cache_key,
                             font_smoothing,
-                        )?;
+                        )?
+                        else {
+                            return Ok(());
+                        };
 
                         let glyph_size =
                             UVec2::new(atlas_info.rect.width() as u32, atlas_info.rect.height() as u32);
